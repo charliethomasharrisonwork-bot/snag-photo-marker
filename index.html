@@ -274,11 +274,40 @@ ol.slots{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;g
     ready.pdf=null;ready.xlsx=null;saveBtn.textContent="Save PDF";xlsBtn.textContent="Save Excel";
     clearTimeout(draftT);draftT=setTimeout(saveDraft,900);
   }
-  function saveDraft(){
-    var rec={k:"d",title:$("ref").value,floor:plan.doc>=0?plan.docs[plan.doc].name:"",cur:cur,
-      snags:snags.map(function(s){return {room:s.room,desc:s.desc,pin:s.pin,cx:s.cx,cy:s.cy,span:s.span,
-        photos:s.photos.map(function(p){return p?{base:p.base,w:p.w,h:p.h,marks:p.marks,flat:p.flat}:null;})};})};
-    idbDo("draft","readwrite",function(st){return st.put(rec);});
+  /* Photos are written to storage as raw bytes. iOS loses Blob objects kept in IndexedDB once the page is unloaded, but bytes survive. */
+  async function photoRec(p){
+    if(!p){return null;}
+    if(!p.bb){p.bb=await p.base.arrayBuffer();}
+    if(p.flat!==p.base&&!p.fb){p.fb=await p.flat.arrayBuffer();}
+    return {bb:p.bb,fb:p.flat===p.base?null:p.fb,w:p.w,h:p.h,marks:p.marks};
+  }
+  var askedPersist=false;
+  async function saveDraft(){
+    try{
+      if(!askedPersist&&navigator.storage&&navigator.storage.persist){askedPersist=true;navigator.storage.persist().catch(function(){});}
+      var out=[];
+      for(var i=0;i<snags.length;i++){
+        var s=snags[i],ph=[];
+        for(var k=0;k<3;k++){ph.push(await photoRec(s.photos[k]));}
+        out.push({room:s.room,desc:s.desc,pin:s.pin,cx:s.cx,cy:s.cy,span:s.span,photos:ph});
+      }
+      var rec={k:"d",title:$("ref").value,floor:plan.doc>=0?plan.docs[plan.doc].name:"",cur:cur,snags:out};
+      await idbDo("draft","readwrite",function(st){return st.put(rec);});
+    }catch(e){}
+  }
+  /* rebuilds a stored photo; returns null if its data can no longer be read */
+  async function revive(x){
+    if(!x){return null;}
+    try{
+      var bb=x.bb||(x.base?await x.base.arrayBuffer():null);
+      if(!bb||!bb.byteLength){return "lost";}
+      var fb=x.fb||null;
+      if(!x.bb&&x.flat){try{fb=await x.flat.arrayBuffer();}catch(_){fb=null;}}
+      var base=new Blob([bb],{type:"image/jpeg"}),flat=fb&&fb.byteLength?new Blob([fb],{type:"image/jpeg"}):base;
+      var p={base:base,flat:flat,w:x.w,h:x.h,marks:x.marks||[],bb:bb,fb:flat===base?null:fb,url:URL.createObjectURL(flat)};
+      if(flat===base&&p.marks.length){await flatten(p);}
+      return p;
+    }catch(e){return "lost";}
   }
 
   /* ---------- snag card ---------- */
@@ -373,7 +402,7 @@ ol.slots{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;g
       var ctx=c.getContext("2d");ctx.drawImage(im,0,0,p.w,p.h);p.marks.forEach(function(m){drawMark(ctx,m);});
       p.flat=await canvasBlob(c,0.86);free(c);
     }
-    p.url=URL.createObjectURL(p.flat);
+    p.fb=null;p.url=URL.createObjectURL(p.flat);
     if(old){URL.revokeObjectURL(old);}
   }
   async function loadFile(i,file){
@@ -813,8 +842,10 @@ ol.slots{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;g
         if(s.pin){numPin(cc.getContext("2d"),(s.pin.x-(s.cx-s.span/2))*1200/s.span,(s.pin.y-(s.cy-s.span/2))*1200/s.span,1200/T,n);}
         rowA.push({data:await bytes(await canvasBlob(cc,0.8)),ar:1,frame:true});free(cc);
       }
-      if(s.photos[0]){rowA.push({data:await bytes(s.photos[0].flat),ar:s.photos[0].w/s.photos[0].h});}
-      for(var k=1;k<3;k++){if(s.photos[k]){rowB.push({data:await bytes(s.photos[k].flat),ar:s.photos[k].w/s.photos[k].h});}}
+      for(var k=0;k<3;k++){
+        var ph=s.photos[k];if(!ph){continue;}
+        try{(k===0?rowA:rowB).push({data:await bytes(ph.flat),ar:ph.w/ph.h});}catch(_){}
+      }
       var rows=[rowA,rowB].filter(function(r){return r.length;}),G=4,availH=H-M-6-y;
       rows.forEach(function(r){
         var ar=0;r.forEach(function(i){ar+=i.ar;});
@@ -900,7 +931,7 @@ ol.slots{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;g
       }
       for(var k=0;k<3;k++){
         var p=s.photos[k];
-        if(p){place(await blobImg(p.flat),p.w,p.h,5+k,ri);}
+        if(p){try{place(await blobImg(p.flat),p.w,p.h,5+k,ri);}catch(_){}}
       }
     }
     if(havePlan&&plan.over){
@@ -975,13 +1006,20 @@ ol.slots{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;g
     if(r[0]&&r[0].length&&!plan.docs.length){
       plan.docs=r[0].map(function(x){return {name:x.name,data:x.data,pdf:null,text:null};});sortDocs();gaList();
     }
-    var d=r[1],back=false;
+    var d=r[1],back=false,lost=0;
     if(d&&d.snags&&d.snags.length&&!snags.some(used)){
-      snags=d.snags.map(function(x){
-        var s=blank();s.room=x.room||"";s.desc=x.desc||"";s.pin=x.pin||null;s.cx=x.cx;s.cy=x.cy;s.span=x.span;
-        s.photos=(x.photos||[null,null,null]).map(function(p){return p&&p.base?{base:p.base,w:p.w,h:p.h,marks:p.marks||[],flat:p.flat||p.base,url:URL.createObjectURL(p.flat||p.base)}:null;});
-        return s;
-      });
+      var list=[];
+      for(var i=0;i<d.snags.length;i++){
+        var x=d.snags[i],s=blank(),ph=x.photos||[];
+        s.room=x.room||"";s.desc=x.desc||"";s.pin=x.pin||null;s.cx=x.cx;s.cy=x.cy;s.span=x.span;
+        for(var k=0;k<3;k++){
+          var p=await revive(ph[k]);
+          if(p==="lost"){lost++;p=null;}
+          s.photos[k]=p;
+        }
+        list.push(s);
+      }
+      snags=list;
       $("ref").value=d.title||"";back=snags.some(used);
       cur=Math.max(0,Math.min(snags.length-1,d.cur||0));
       $("room").value=S().room;$("desc").value=S().desc;render();
@@ -989,7 +1027,8 @@ ol.slots{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;g
     var di=-1;if(d&&d.floor){plan.docs.forEach(function(o,i){if(o.name===d.floor){di=i;}});}
     if(di<0&&back){snags.forEach(function(s){s.pin=null;s.cx=s.cy=s.span=null;});}
     if(hasPdf&&plan.docs.length&&plan.doc<0){await setFloor(di>=0?di:0,di>=0);}
-    if(back){say("Picked up the report you had in progress.","ok");}
+    if(lost){say(lost+(lost===1?" photo":" photos")+" could not be recovered after the browser closed the page. The descriptions and pins are still here; retake the missing photos.","err");saveDraft();}
+    else if(back){say("Picked up the report you had in progress.","ok");}
   });
 })();
 </script>
